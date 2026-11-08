@@ -593,34 +593,61 @@ pub const Tap = struct {
     expert_act: *const fn (ctx: *anyopaque, layer: usize, act: A, ids: A) anyerror!void,
 };
 
-/// Directional ablation (Arditi et al. 2024): every write to the residual stream, the embedding, each attention and
-/// FFN output and each Engram value, loses `s` times its component along the unit direction `r`. The arrays are the
-/// caller's, f32: `r` `[dim]`, `col` the same `[dim, 1]`, `s` a scalar.
-pub const Ablation = struct { r: A, col: A, s: A };
+/// A loaded per-layer bank: one unit direction per capture site, as MLX arrays the ablate helpers index by site. Owned
+/// by the model (`ablation_banks`), freed in `Model.deinit`; a call's `Ablation` borrows it.
+pub const AblationBank = struct {
+    r: A, // [n_sites, dim]
+    col: A, // [n_sites, dim, 1]
+    n_sites: u32,
+};
 
-/// `y - s (y . r) r` over the last axis, in f32, back in `y`'s dtype; `y` itself without an ablation.
-fn ablate(sc: *Scope, m: *const Model, y: A) !A {
-    return if (m.ablation) |ab| ablateWith(sc, ab, y) else y;
+/// Directional ablation (Arditi et al. 2024): every write to the residual stream, the embedding, each attention and
+/// FFN output and each Engram value, loses `s` times its component along its site's unit direction. `r`/`col` hold one
+/// direction per site (`[n_sites, dim]` / `[n_sites, dim, 1]`); a call ablates only the site it names, so a per-layer
+/// bank removes each layer's own refusal component where a single shared direction cannot.
+pub const Ablation = struct {
+    r: A, // [n_sites, dim]
+    col: A, // [n_sites, dim, 1]
+    s: A,
+};
+
+/// Site `site`'s unit direction (`[dim]`) and its column form (`[dim, 1]`), out of the per-site bank.
+fn siteDir(sc: *Scope, ab: Ablation, site: usize) !A {
+    const one = try sc.slice(ab.r, 0, site, site + 1);
+    return sc.reshape(one, &.{ ci(dim(ab.r, 1)) });
+}
+fn siteCol(sc: *Scope, ab: Ablation, site: usize) !A {
+    const one = try sc.slice(ab.col, 0, site, site + 1);
+    return sc.reshape(one, &.{ ci(dim(ab.col, 1)), 1 });
 }
 
-pub fn ablateWith(sc: *Scope, ab: Ablation, y: A) !A {
+/// `y - s (y . r) r` over the last axis, in f32, back in `y`'s dtype; `y` itself without an ablation.
+fn ablate(sc: *Scope, m: *const Model, site: usize, y: A) !A {
+    return if (m.ablation) |ab| ablateWith(sc, ab, site, y) else y;
+}
+
+pub fn ablateWith(sc: *Scope, ab: Ablation, site: usize, y: A) !A {
+    const r = try siteDir(sc, ab, site);
+    const col = try siteCol(sc, ab, site);
     const yf = try sc.astype(y, .float32);
-    const proj = try sc.mul(try sc.matmul(yf, ab.col), ab.s);
-    return sc.astype(try sc.sub(yf, try sc.mul(proj, ab.r)), mlx.mlx_array_dtype(y));
+    const proj = try sc.mul(try sc.matmul(yf, col), ab.s);
+    return sc.astype(try sc.sub(yf, try sc.mul(proj, r)), mlx.mlx_array_dtype(y));
 }
 
 /// `ablate` of the FFN output inside a stream the fused decode kernel already expanded (`x2 = post y + comb^T x1`): the
 /// output's component along `r` in copy k is `x2_k . r - sum_j comb[j, k] (x1_j . r)`.
-fn ablateExpanded(sc: *Scope, m: *const Model, x1: A, x2: A, comb: A) !A {
-    return if (m.ablation) |ab| ablateExpandedWith(sc, ab, x1, x2, comb) else x2;
+fn ablateExpanded(sc: *Scope, m: *const Model, site: usize, x1: A, x2: A, comb: A) !A {
+    return if (m.ablation) |ab| ablateExpandedWith(sc, ab, site, x1, x2, comb) else x2;
 }
 
-pub fn ablateExpandedWith(sc: *Scope, ab: Ablation, x1: A, x2: A, comb: A) !A {
+pub fn ablateExpandedWith(sc: *Scope, ab: Ablation, site: usize, x1: A, x2: A, comb: A) !A {
+    const r = try siteDir(sc, ab, site);
+    const col = try siteCol(sc, ab, site);
     const x2f = try sc.astype(x2, .float32);
-    const d1 = try sc.matmul(try sc.astype(try sc.reshape(x1, mlx.getShape(x2)), .float32), ab.col); // [L, hc, 1]
+    const d1 = try sc.matmul(try sc.astype(try sc.reshape(x1, mlx.getShape(x2)), .float32), col); // [L, hc, 1]
     const mixed = try sc.matmul(try sc.transpose(try sc.astype(comb, .float32), &.{ 0, 2, 1 }), d1);
-    const along = try sc.mul(try sc.sub(try sc.matmul(x2f, ab.col), mixed), ab.s);
-    return sc.astype(try sc.sub(x2f, try sc.mul(along, ab.r)), mlx.mlx_array_dtype(x2));
+    const along = try sc.mul(try sc.sub(try sc.matmul(x2f, col), mixed), ab.s);
+    return sc.astype(try sc.sub(x2f, try sc.mul(along, r)), mlx.mlx_array_dtype(x2));
 }
 
 /// Calibration tap: per layer, the mean of the hyper-connection copies of the stream entering it (and, last, leaving
@@ -840,6 +867,9 @@ pub const Model = struct {
     profile: ?*Profile = null,
     /// The request's directional ablation (`ablate`), set by the caller for the length of one call; null = none.
     ablation: ?Ablation = null,
+    /// Per-name ablation banks (a per-layer direction set), loaded lazily from a profile's `bank.f32` and freed in
+    /// `deinit`; the armed `ablation` borrows one of these.
+    ablation_banks: std.StringHashMapUnmanaged(AblationBank) = .empty,
     /// Calibration: the stream entering each layer, recorded for every prompt pass (`StreamTap`); null = none.
     stream_tap: ?*StreamTap = null,
 
@@ -863,6 +893,13 @@ pub const Model = struct {
         }
         for (self.owned.items) |x| _ = mlx.mlx_array_free(x);
         self.owned.deinit(self.gpa);
+        var bank_it = self.ablation_banks.iterator();
+        while (bank_it.next()) |entry| {
+            const b = entry.value_ptr.*;
+            _ = mlx.mlx_array_free(b.r);
+            _ = mlx.mlx_array_free(b.col);
+        }
+        self.ablation_banks.deinit(self.gpa);
         self.gpa.free(self.layers);
         self.gpa.destroy(self);
     }
@@ -2677,19 +2714,19 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, r: kernels.Rou
 fn engramApply(sc: *Scope, m: *const Model, e: *const EngramLayer, x: A, rows: A) !A {
     const wkv_in = try sc.astype(try sc.reshape(rows, &.{ ci(dim(x, 0)), -1 }), m.act);
     try tapInput(m, e.layer, .engram_in, wkv_in);
-    const kv = try ablateEngramValue(sc, m, try e.wkv.apply(sc, wkv_in));
+    const kv = try ablateEngramValue(sc, m, e.layer + 1, try e.wkv.apply(sc, wkv_in));
     if (fusedOn(sc, m) and dim(x, 0) <= NARROW_ROWS) return kernels.engramGate(sc, x, kv, e.qk, m.cfg.eps);
     return engramGateOps(sc, &m.cfg, e.qk, x, kv);
 }
 
 /// `ablate` of the value slice of the Engram `wkv` rows `[L, (hc + 1) * dim]`; the per-copy keys only feed the gate.
-fn ablateEngramValue(sc: *Scope, m: *const Model, kv: A) !A {
-    return if (m.ablation) |ab| ablateValueWith(sc, ab, kv, m.cfg.hc_mult * m.cfg.dim) else kv;
+fn ablateEngramValue(sc: *Scope, m: *const Model, site: usize, kv: A) !A {
+    return if (m.ablation) |ab| ablateValueWith(sc, ab, site, kv, m.cfg.hc_mult * m.cfg.dim) else kv;
 }
 
 /// `ablateWith` of the columns of `kv` past `split` (the value), the rest as they are.
-pub fn ablateValueWith(sc: *Scope, ab: Ablation, kv: A, split: usize) !A {
-    const value = try ablateWith(sc, ab, try sc.slice(kv, -1, split, dim(kv, -1)));
+pub fn ablateValueWith(sc: *Scope, ab: Ablation, site: usize, kv: A, split: usize) !A {
+    const value = try ablateWith(sc, ab, site, try sc.slice(kv, -1, split, dim(kv, -1)));
     return sc.concat(&.{ try sc.slice(kv, -1, 0, split), value }, -1);
 }
 
@@ -2791,7 +2828,7 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
         var asc = Scope.init(sc.a, sc.s);
         defer asc.deinit();
         const o = if (ds) |d| try dsparkAttention(&asc, m, li, h, d, p0) else try attention(&asc, m, st, li, h, p0, sh, span);
-        break :blk try ablate(sc, m, try sc.keep(asc.out(o)));
+        break :blk try ablate(sc, m, li + 1, try sc.keep(asc.out(o)));
     };
     if (m.trace) |t| try t.put("attn_{d}", .{li}, a);
     if (width_probe) |t| try t.put("attn_{d}", .{li}, a);
@@ -2806,7 +2843,7 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
     try tapInput(m, li, .ffn_in, h2);
     if (m.trace) |t| try t.put("ffn_in_{d}", .{li}, h2);
     if (width_probe) |t| try t.put("ffn_in_{d}", .{li}, h2);
-    if (sh.img.ctx == null) if (try ffnDecode(sc, m, li, h2, x1, &mix)) |x2| return .{ .x = sc.out(try ablateExpanded(sc, m, x1, x2, mix.sp.?.comb)), .pre = sc.out(mix.sp.?.pre) };
+    if (sh.img.ctx == null) if (try ffnDecode(sc, m, li, h2, x1, &mix)) |x2| return .{ .x = sc.out(try ablateExpanded(sc, m, li + 1, x1, x2, mix.sp.?.comb)), .pre = sc.out(mix.sp.?.pre) };
     const r = try router(sc, m, li, h2, sh.img, &mix);
     const sf = try mix.splitOnce(sc, m);
     const folded = foldsExpand(m, sh, li, x1);
@@ -2817,7 +2854,7 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
         const expand: ?Expand = if (folded) .{ .x = x1, .post = sf.post, .comb = sf.comb } else null;
         const out = try sc.keep(fsc.out(try moe(&fsc, m, li, h2, sh, r, &.{ sf.pre, sf.post, sf.comb }, expand)));
         // A folded expand is the new stream, not the FFN output; `foldsExpand` keeps it off while an ablation is armed.
-        break :blk if (folded) out else try ablate(sc, m, out);
+        break :blk if (folded) out else try ablate(sc, m, li + 1, out);
     };
     if (sh.spec) |*u| {
         u.x1 = sc.out(x1);
@@ -3217,7 +3254,7 @@ pub const VisionRows = struct { rows: A, offset: usize };
 /// The residual streams before layer 0 (the embedding in every hyper-connection copy) and the first pre-mix weights.
 fn startStreams(sc: *Scope, m: *const Model, emb_in: A, L: usize) !struct { A, A } {
     const c = &m.cfg;
-    const emb = try ablate(sc, m, emb_in);
+    const emb = try ablate(sc, m, 0, emb_in);
     const x = sc.out(try sc.contiguous(try sc.broadcast(try sc.expand(emb, 1), &.{ ci(L), ci(c.hc_mult), ci(c.dim) })));
     errdefer _ = mlx.mlx_array_free(x);
     const first = try sc.op2(mlx.mlx_equal, try sc.arange(0, c.hc_mult), try sc.i(0));
@@ -3522,7 +3559,7 @@ fn settleRecord(m: *const Model, u: *const Unresolved) !?A {
     if (sum == null) spec_kept += 1 else spec_rebuilt += 1;
     if ((spec_kept + spec_rebuilt) % 4096 == 0) log.info("[dsv41] route-spec: {d} layers kept, {d} rebuilt after a pick left the map ({d} of those {d} picks recomputed)\n", .{ spec_kept, spec_rebuilt, spec_redo_picks, spec_rebuilt_picks });
     if (sum == null) return null;
-    return sc.out(try hcExpand(&sc, m, u.x1, try ablate(&sc, m, try sc.astype(sum.?, m.act)), u.post, u.comb));
+    return sc.out(try hcExpand(&sc, m, u.x1, try ablate(&sc, m, u.li + 1, try sc.astype(sum.?, m.act)), u.post, u.comb));
 }
 
 /// Checks the pass's unresolved layer, if any, and takes its exact output where the queued chain missed.
@@ -4076,7 +4113,7 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
     const hc = c.hc_mult;
     var in: [cfg_mod.max_block]i32 = undefined;
     for (in[0..B], 0..) |*v, k| v.* = @intCast(if (k == 0) t1 else c.dspark.noise_id);
-    const emb = try ablate(&sc, m, try m.embed.rows(&sc, try sc.ints(in[0..B], &.{ci(B)}), m.act));
+    const emb = try ablate(&sc, m, 0, try m.embed.rows(&sc, try sc.ints(in[0..B], &.{ci(B)}), m.act));
     var x = try sc.contiguous(try sc.broadcast(try sc.expand(emb, 1), &.{ ci(B), ci(hc), ci(c.dim) }));
     var pre = try sc.broadcast(try sc.astype(try sc.op2(mlx.mlx_equal, try sc.arange(0, hc), try sc.i(0)), .float32), &.{ ci(B), ci(hc) });
     var dummy = try Shared.init(gpa, 1);
