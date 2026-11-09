@@ -76,12 +76,26 @@ fn loadBank(mdl: *dsv.Model, name: []const u8, d: mlx.mlx_array, n_sites: usize,
     return .{ .r = r, .col = col, .n_sites = @intCast(n_sites) };
 }
 
+/// The bank file's bytes, or null when there is no such file or it is not exactly `want` bytes (a limited reader
+/// refuses a file that fills its cap exactly, hence the one byte of slack).
+fn readBankBytes(io: std.Io, path: []const u8, a: std.mem.Allocator, want: usize) !?[]u8 {
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(want + 1)) catch |e| switch (e) {
+        error.FileNotFound, error.StreamTooLong => return null,
+        else => return e,
+    };
+    if (data.len != want) {
+        a.free(data);
+        return null;
+    }
+    return data;
+}
+
 /// The bank's `r` (or `col` view of it) from `path`; the single direction broadcast to every site when there is none.
 fn bankArray(mdl: *dsv.Model, path: []const u8, n_sites: usize, dim: usize, d: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const data = std.Io.Dir.cwd().readFileAlloc(io, path, mdl.gpa, .limited(n_sites * dim * 4)) catch return broadcastBank(d, n_sites, dim, s);
+    const want = n_sites * dim * 4;
+    const data = (try readBankBytes(std.Io.Threaded.global_single_threaded.io(), path, mdl.gpa, want)) orelse
+        return broadcastBank(d, n_sites, dim, s);
     defer mdl.gpa.free(data);
-    if (data.len != n_sites * dim * 4) return broadcastBank(d, n_sites, dim, s);
     const r = mlx.mlx_array_new_data(data.ptr, &[_]c_int{ @intCast(n_sites), @intCast(dim) }, 2, .float32);
     errdefer _ = mlx.mlx_array_free(r);
     return r;
@@ -115,6 +129,39 @@ pub fn disarm(mdl: *dsv.Model) void {
     const ab = mdl.ablation orelse return;
     _ = mlx.mlx_array_free(ab.s);
     mdl.ablation = null;
+}
+
+test "sushi_ds41 ablation: a bank file of exactly the expected size loads (a limited read refuses a full cap)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const dir = try std.fs.path.join(std.testing.allocator, &.{ root, "bank.f32" });
+    defer std.testing.allocator.free(dir);
+    // The bank a 40-layer model reads: (layers + 1) sites, 5120 dims, f32.
+    const want = 41 * 5120 * 4;
+    const buf = try std.testing.allocator.alloc(u8, want + 1);
+    defer std.testing.allocator.free(buf);
+    @memset(buf, 0);
+    const Try = struct {
+        fn write(path: []const u8, bytes: []const u8) !void {
+            var f = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .truncate = true });
+            defer f.close(std.testing.io);
+            try f.writeStreamingAll(std.testing.io, bytes);
+        }
+        fn got(path: []const u8, want_bytes: usize) !bool {
+            const bytes = try readBankBytes(std.testing.io, path, std.testing.allocator, want_bytes);
+            defer if (bytes) |b| std.testing.allocator.free(b);
+            return bytes != null and bytes.?.len == want_bytes;
+        }
+    };
+    try Try.write(dir, buf[0..want]);
+    try std.testing.expect(try Try.got(dir, want)); // exact size: the defect this guards
+    try Try.write(dir, buf[0 .. want - 1]);
+    try std.testing.expect(!try Try.got(dir, want)); // short is not a bank
+    try Try.write(dir, buf[0..want]);
+    try std.testing.expect(!try Try.got(dir, want - 1)); // a cap one byte short refuses rather than truncates
 }
 
 test "sushi_ds41 ablation: the tap reads prompt passes only" {

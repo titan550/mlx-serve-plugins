@@ -621,9 +621,12 @@ fn siteCol(sc: *Scope, ab: Ablation, site: usize) !A {
     return sc.reshape(one, &.{ ci(dim(ab.col, 1)), 1 });
 }
 
-/// `y - s (y . r) r` over the last axis, in f32, back in `y`'s dtype; `y` itself without an ablation.
+/// `y - s (y . r) r` over the last axis, in f32, back in `y`'s dtype; `y` itself without an ablation, and without one
+/// at a site past the bank's rows: the DSpark stages sit above the backbone and have no captured direction.
 fn ablate(sc: *Scope, m: *const Model, site: usize, y: A) !A {
-    return if (m.ablation) |ab| ablateWith(sc, ab, site, y) else y;
+    const ab = m.ablation orelse return y;
+    if (site >= dim(ab.r, 0)) return y;
+    return ablateWith(sc, ab, site, y);
 }
 
 pub fn ablateWith(sc: *Scope, ab: Ablation, site: usize, y: A) !A {
@@ -637,7 +640,9 @@ pub fn ablateWith(sc: *Scope, ab: Ablation, site: usize, y: A) !A {
 /// `ablate` of the FFN output inside a stream the fused decode kernel already expanded (`x2 = post y + comb^T x1`): the
 /// output's component along `r` in copy k is `x2_k . r - sum_j comb[j, k] (x1_j . r)`.
 fn ablateExpanded(sc: *Scope, m: *const Model, site: usize, x1: A, x2: A, comb: A) !A {
-    return if (m.ablation) |ab| ablateExpandedWith(sc, ab, site, x1, x2, comb) else x2;
+    const ab = m.ablation orelse return x2;
+    if (site >= dim(ab.r, 0)) return x2;
+    return ablateExpandedWith(sc, ab, site, x1, x2, comb);
 }
 
 pub fn ablateExpandedWith(sc: *Scope, ab: Ablation, site: usize, x1: A, x2: A, comb: A) !A {
@@ -2721,7 +2726,9 @@ fn engramApply(sc: *Scope, m: *const Model, e: *const EngramLayer, x: A, rows: A
 
 /// `ablate` of the value slice of the Engram `wkv` rows `[L, (hc + 1) * dim]`; the per-copy keys only feed the gate.
 fn ablateEngramValue(sc: *Scope, m: *const Model, site: usize, kv: A) !A {
-    return if (m.ablation) |ab| ablateValueWith(sc, ab, site, kv, m.cfg.hc_mult * m.cfg.dim) else kv;
+    const ab = m.ablation orelse return kv;
+    if (site >= dim(ab.r, 0)) return kv;
+    return ablateValueWith(sc, ab, site, kv, m.cfg.hc_mult * m.cfg.dim);
 }
 
 /// `ablateWith` of the columns of `kv` past `split` (the value), the rest as they are.
